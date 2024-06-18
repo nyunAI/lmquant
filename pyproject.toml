@@ -9,7 +9,7 @@ readme = "README.md"
 [tool.poetry.dependencies]
 python = ">= 3.10 < 3.12"
 tqdm = ">= 4.66.0"
-torch = ">= 2.2.0"
+torch = "== 2.3.0"
 ninja = ">= 1.11.1"
 bitsandbytes = ">= 0.42.0"
 transformers = ">= 4.37.0"
@@ -19,6 +19,10 @@ datasets = ">= 2.16.0"
 sentencepiece = ">= 0.1.99"
 omniconfig = ">= 0.1.5"
 protobuf = ">= 5.26.0"
+
+[tool.poetry.dependencies.strenum]
+version = "*"
+python = "< 3.11"
 
 [tool.poetry.group.dev.dependencies]
 flake8 = ">= 7.0"

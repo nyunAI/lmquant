@@ -1,7 +1,10 @@
 # -*- coding: utf-8 -*-
 """LLM Quantization key."""
 
-from enum import StrEnum
+try:
+    from enum import StrEnum
+except ImportError:
+    from strenum import StrEnum
 
 __all__ = ["LlmModuleKey"]
 

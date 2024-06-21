@@ -3,6 +3,7 @@
 
 import typing as tp
 from dataclasses import dataclass, field
+from lmquant.llm.nn.attention import patch_qkv_proj_in_attention_block
 
 import torch.nn as nn
 from transformers.models.llama.modeling_llama import (
@@ -42,6 +43,17 @@ from transformers.models.opt.modeling_opt import (
     OPTForSequenceClassification,
     OPTModel,
 )
+
+from transformers.models.phi3.modeling_phi3 import (
+    Phi3Attention,
+    Phi3Config,
+    Phi3DecoderLayer,
+    Phi3ForCausalLM,
+    Phi3ForSequenceClassification,
+    Phi3MLP,
+    Phi3Model,
+)
+
 from transformers.models.qwen2.modeling_qwen2 import (
     Qwen2Attention,
     Qwen2Config,
@@ -418,6 +430,8 @@ def extract_llm(model: nn.Module) -> LlmModelStruct | None:
             MistralForSequenceClassification,
             MixtralForCausalLM,
             MixtralForSequenceClassification,
+            Phi3ForCausalLM,
+            Phi3ForSequenceClassification,
             Qwen2ForCausalLM,
             Qwen2ForSequenceClassification,
         ),
@@ -426,7 +440,7 @@ def extract_llm(model: nn.Module) -> LlmModelStruct | None:
         backbone_name = "model"
     else:
         raise ValueError(f"Unsupported model type: {type(model)}")
-    if isinstance(model, (OPTForCausalLM, LlamaForCausalLM, MistralForCausalLM, MixtralForCausalLM, Qwen2ForCausalLM)):
+    if isinstance(model, (OPTForCausalLM, LlamaForCausalLM, MistralForCausalLM, MixtralForCausalLM, Phi3ForCausalLM, Qwen2ForCausalLM)):
         fc = model.lm_head
         fc_name = "lm_head"
     elif isinstance(model, (OPTForQuestionAnswering)):
@@ -439,6 +453,7 @@ def extract_llm(model: nn.Module) -> LlmModelStruct | None:
             LlamaForSequenceClassification,
             MistralForSequenceClassification,
             MixtralForSequenceClassification,
+            Phi3ForSequenceClassification,
             Qwen2ForSequenceClassification,
         ),
     ):
@@ -461,7 +476,7 @@ def extract_llm(model: nn.Module) -> LlmModelStruct | None:
             do_norm_before=config.do_layer_norm_before,
             tie_word_embeddings=config.tie_word_embeddings,
         )
-    elif isinstance(config, (LlamaConfig, MistralConfig, MixtralConfig, Qwen2Config)):
+    elif isinstance(config, (LlamaConfig, MistralConfig, MixtralConfig, Phi3Config, Qwen2Config)):
         config_struct = LlmConfigStruct(
             vocab_size=config.vocab_size,
             hidden_size=config.hidden_size,
@@ -500,7 +515,7 @@ def extract_llm_backbone(backbone: nn.Module, parent: LlmModelStruct) -> LlmBack
         layers_name = "layers"
         first_ln_name, final_ln_name = "", "final_layer_norm"
         proj_in_name, proj_out_name = "project_in", "project_out"
-    elif isinstance(backbone, (LlamaModel, MistralModel, MixtralModel, Qwen2Model)):
+    elif isinstance(backbone, (LlamaModel, MistralModel, MixtralModel, Phi3Model, Qwen2Model)):
         embeddings = [backbone.embed_tokens]
         layers = backbone.layers
         first_ln, final_ln = None, backbone.norm
@@ -627,6 +642,32 @@ def extract_llm_layer(layer: nn.Module, layer_idx: int, parent: LlmBackboneStruc
         proj_2nd_name = "w2"
         experts_name = "experts"
         router_name = "gate"
+    elif isinstance(layer, Phi3DecoderLayer):
+        attn_ln = layer.input_layernorm
+        attn_block = layer.self_attn
+        assert isinstance(attn_block, Phi3Attention)
+        ffn_ln = layer.post_attention_layernorm
+        ffn_block = layer.mlp
+        assert isinstance(ffn_block, Phi3MLP)
+        # patch_qkv_proj_in_attention_block(attn_block)
+        proj_qkv = [attn_block.q_proj, attn_block.k_proj, attn_block.v_proj]
+        proj_out = attn_block.o_proj
+        proj_1st = [ffn_block.gate_up_proj]
+        proj_2nd = [ffn_block.down_proj]
+        experts = [ffn_block]
+        router = None
+        proj_2nd_lowerbound = None
+        attn_block_kwargs = ("attention_mask", "position_ids", "past_key_value", "output_attentions", "use_cache")
+        attn_ln_name = "input_layernorm"
+        attn_block_name = "self_attn"
+        proj_qkv_names = ["q_proj", "k_proj", "v_proj"]
+        proj_out_name = "o_proj"
+        ffn_ln_name = "post_attention_layernorm"
+        ffn_block_name = "mlp"
+        proj_1st_names = ["gate_up_proj"]
+        proj_2nd_name = "down_proj"
+        experts_name = ""
+        router_name = ""
     else:
         raise ValueError(f"Unsupported layer type: {type(layer)}")
     return LlmDecoderLayerStruct(

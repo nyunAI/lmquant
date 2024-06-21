@@ -19,7 +19,7 @@ from lmquant.dataset.cache.calibration import CalibrationCache
 from lmquant.dataset.config import BaseCalibDatasetConfig
 from lmquant.dataset.transform import LinearTransformFn
 
-from .nn import LlmDecoderLayerStruct, LlmModelStruct, RotaryEmbedding
+from .nn import LlmDecoderLayerStruct, LlmModelStruct, RotaryEmbedding, QKVProj
 
 __all__ = ["LlmCalibConfig", "LlmCalibrationCache", "LlmConcatCache", "LlmAverageCache"]
 
@@ -122,7 +122,7 @@ class LlmCalibrationCache(CalibrationCache):
         Raises:
             NotImplementedError: If the module is not supported.
         """
-        if isinstance(m, (nn.Linear, RotaryEmbedding, MixtralSparseMoeBlock)) or m.__class__.__name__.endswith(
+        if isinstance(m, (nn.Linear, QKVProj, RotaryEmbedding, MixtralSparseMoeBlock)) or m.__class__.__name__.endswith(
             ("DecoderLayer", "Attention", "MLP")
         ):
             return IOActivationsCache(

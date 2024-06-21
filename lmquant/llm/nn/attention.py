@@ -7,8 +7,10 @@ import logging
 import torch
 import torch.nn as nn
 from transformers.models.llama.modeling_llama import rotate_half
+from transformers.models.phi3.modeling_phi3 import Phi3Attention
 
 from lmquant.utils.patch import copy_func
+from lmquant.llm.nn.linear import QKVProj
 
 __all__ = ["patch_attention", "RotaryEmbedding"]
 
@@ -122,6 +124,9 @@ def patch_attention(model: nn.Module) -> nn.Module:
     for module_name, module in model.named_modules():
         classname = type(module).__name__
         if classname.lower().endswith("attention"):
+            if isinstance(module, Phi3Attention):
+                logger.info(f"- Patching qkv_proj in {module_name}")
+                patch_qkv_proj_in_attention_block(module)
             forward_name = ""
             if isinstance(module.forward, functools.partial):
                 if hasattr(module, "_lmquant_orig_forward"):
@@ -149,3 +154,42 @@ def patch_attention(model: nn.Module) -> nn.Module:
                 setattr(module, forward_name, new_forward.__get__(module))
 
     return model
+
+
+def patch_qkv_proj_in_attention_block(
+        attn_block: nn.Module
+) -> None:
+    """Replace (inplace) qkv_proj with a custom Linear layer along with q, k, v Linear layers."""
+
+    assert isinstance(attn_block, (Phi3Attention)
+                      ), f"Supported only for Phi3Attention, got {type(attn_block)}"
+
+    # get the weights of q, k, v from qkv_proj
+    q = attn_block.qkv_proj.weight.data[:attn_block.num_heads *
+                                        attn_block.head_dim, :]
+    k = attn_block.qkv_proj.weight.data[attn_block.num_heads * attn_block.head_dim:attn_block.num_heads *
+                                        attn_block.head_dim + attn_block.num_key_value_heads * attn_block.head_dim, :]
+    v = attn_block.qkv_proj.weight.data[attn_block.num_heads *
+                                        attn_block.head_dim + attn_block.num_key_value_heads * attn_block.head_dim:, :]
+
+    # create new Linear layers for q, k, v
+    q_proj = nn.Linear(attn_block.hidden_size,
+                       attn_block.num_heads * attn_block.head_dim, bias=False)
+    k_proj = nn.Linear(attn_block.hidden_size,
+                       attn_block.num_key_value_heads * attn_block.head_dim, bias=False)
+    v_proj = nn.Linear(attn_block.hidden_size,
+                       attn_block.num_key_value_heads * attn_block.head_dim, bias=False)
+    q_proj.weight.data = q
+    k_proj.weight.data = k
+    v_proj.weight.data = v
+
+    # register the new Linear layers as children of the attn_block
+    attn_block.add_module("q_proj", q_proj)
+    attn_block.add_module("k_proj", k_proj)
+    attn_block.add_module("v_proj", v_proj)
+
+    # update the qkv_proj layer to be a QKVProj layer
+    delattr(attn_block, "qkv_proj")
+    # attn_block.qkv_proj = QKVProj.from_q_k_v(
+    #     attn_block.q_proj, attn_block.k_proj, attn_block.v_proj)
+

@@ -8,7 +8,7 @@ from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
-from datasets import load_dataset
+from datasets import load_from_disk
 from omniconfig import configclass
 from transformers.cache_utils import DynamicCache
 from transformers.models.mixtral.modeling_mixtral import MixtralSparseMoeBlock
@@ -167,42 +167,54 @@ class LlmCalibrationCache(CalibrationCache):
             Generator[torch.Tensor, None, None]: Generator for iterating over samples.
                 Each sample is a tensor of shape (1, seq_length).
         """
-        if self.config.data == "pileval":
-            assert tokenizer is not None, "tokenizer is required for pileval dataset"
-            dataset = load_dataset(self.config.dataset_path, split="validation")
-            dataset = dataset.shuffle(seed=42)
-            rng = random.Random(42)
-            samples, num_tokens = [], 0
-            for _data in dataset:
-                line = _data["text"]
-                line = line.strip()
-                # line_encoded is a list of token ids
-                line_encoded = tokenizer.encode(line)
-                seq_length = len(line_encoded)
-                if seq_length == 0:
-                    continue
-                if self.config.min_seq_length > 0 and seq_length < self.config.min_seq_length:
-                    continue
-                if self.config.max_seq_length > 0 and seq_length > self.config.max_seq_length:
-                    continue
-                # sample is a tensor of shape (1, seq_length)
-                sample = torch.tensor([line_encoded])
-                if seq_length > self.config.seq_length:
-                    tok = rng.randint(0, seq_length - self.config.seq_length)
-                    sample = sample[:, tok : tok + self.config.seq_length]
-                samples.append(sample)
-                num_tokens += sample.shape[1]
-                if len(samples) >= self.config.num_samples and num_tokens >= self.config.num_tokens:
-                    break
-            # now concatenate all samples and split according to seq_length
-            samples = torch.cat(samples, dim=1).split(self.config.seq_length, dim=1)
-            if num_tokens > self.config.num_tokens:
-                samples = samples[:-1]
-            samples = samples[: self.config.num_samples]
-            for sample in samples:
-                yield sample
-        else:
-            raise NotImplementedError(f"Calibration dataset {self.config.data} is not supported")
+        assert tokenizer is not None, "tokenizer is required for pileval dataset"
+
+
+        # region custom dataset kompress
+        import os
+        import json
+        import logging
+        kompress_data_path = os.environ["KOMPRESS_DATA_PATH"]
+        with open(kompress_data_path, "r") as f:
+            kompress_data_dict = json.load(f)
+        logging.info(f"Loaded kompress data {kompress_data_dict} from {kompress_data_path}")
+        split = kompress_data_dict["split"]
+        dataset_name_or_path = kompress_data_dict["dataset_name_or_path"]
+        text_column = kompress_data_dict["text_column"]
+        dataset = load_from_disk(dataset_name_or_path)[split]
+        # endregion
+
+        dataset = dataset.shuffle(seed=42)
+        rng = random.Random(42)
+        samples, num_tokens = [], 0
+        for _data in dataset:
+            line = _data[text_column]
+            line = line.strip()
+            # line_encoded is a list of token ids
+            line_encoded = tokenizer.encode(line)
+            seq_length = len(line_encoded)
+            if seq_length == 0:
+                continue
+            if self.config.min_seq_length > 0 and seq_length < self.config.min_seq_length:
+                continue
+            if self.config.max_seq_length > 0 and seq_length > self.config.max_seq_length:
+                continue
+            # sample is a tensor of shape (1, seq_length)
+            sample = torch.tensor([line_encoded])
+            if seq_length > self.config.seq_length:
+                tok = rng.randint(0, seq_length - self.config.seq_length)
+                sample = sample[:, tok : tok + self.config.seq_length]
+            samples.append(sample)
+            num_tokens += sample.shape[1]
+            if len(samples) >= self.config.num_samples and num_tokens >= self.config.num_tokens:
+                break
+        # now concatenate all samples and split according to seq_length
+        samples = torch.cat(samples, dim=1).split(self.config.seq_length, dim=1)
+        if num_tokens > self.config.num_tokens:
+            samples = samples[:-1]
+        samples = samples[: self.config.num_samples]
+        for sample in samples:
+            yield sample
 
     def iter_layer_activations(  # noqa: C901
         self,

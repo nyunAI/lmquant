@@ -8,20 +8,30 @@ from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
-from datasets import load_from_disk
+from datasets import load_from_disk, load_dataset
 from omniconfig import configclass
 from transformers.cache_utils import DynamicCache
 from transformers.models.mixtral.modeling_mixtral import MixtralSparseMoeBlock
+from torch.utils.data import Dataset, DataLoader
+from transformers import AutoTokenizer
 
 from lmquant.dataset.cache.action import AverageCache, CacheAction, ConcatCache
 from lmquant.dataset.cache.activation import ActivationCache, IOActivationsCache
-from lmquant.dataset.cache.calibration import CalibrationCache
+from lmquant.dataset.cache.calibration import CalibrationCache, CalibSample
 from lmquant.dataset.config import BaseCalibDatasetConfig
 from lmquant.dataset.transform import LinearTransformFn
 
 from .nn import LlmDecoderLayerStruct, LlmModelStruct, RotaryEmbedding
 
 __all__ = ["LlmCalibConfig", "LlmCalibrationCache", "LlmConcatCache", "LlmAverageCache"]
+
+
+def process_sample(sample, is_vlm) -> None:
+    if is_vlm:
+        prefix = "<|im_start|>user\n"
+        assert prefix in sample, "Expecting a VLM sample"
+        return sample.replace(prefix, prefix + f"<image>\n")
+    return sample
 
 
 @configclass
@@ -77,7 +87,11 @@ class LlmConcatCache(ConcatCache):
     """Action for concatenating cached activations."""
 
     def _unpack(
-        self, name: str, module: nn.Module, args: tuple[torch.Tensor, ...], kwargs: dict[str, tp.Any] | None
+        self,
+        name: str,
+        module: nn.Module,
+        args: tuple[torch.Tensor, ...],
+        kwargs: dict[str, tp.Any] | None,
     ) -> tuple[torch.Tensor, ...]:
         if len(args) == 0:
             assert "hidden_states" in kwargs, "hidden_states should be in kwargs if args is empty"
@@ -89,7 +103,11 @@ class LlmAverageCache(AverageCache):
     """Action for averaging cached activations."""
 
     def _unpack(
-        self, name: str, module: nn.Module, args: tuple[torch.Tensor, ...], kwargs: dict[str, tp.Any] | None
+        self,
+        name: str,
+        module: nn.Module,
+        args: tuple[torch.Tensor, ...],
+        kwargs: dict[str, tp.Any] | None,
     ) -> tuple[torch.Tensor, ...]:
         if len(args) == 0:
             assert "hidden_states" in kwargs, "hidden_states should be in kwargs if args is empty"
@@ -101,6 +119,7 @@ class LlmCalibrationCache(CalibrationCache):
     """Cache for collecting calibration dataset for quantizing large language models."""
 
     config: LlmCalibConfig
+    __is_vlm_dataset: bool = False
 
     def __init__(self, config: LlmCalibConfig) -> None:
         """Initialize LlmCalibrationCache.
@@ -148,6 +167,16 @@ class LlmCalibrationCache(CalibrationCache):
                     assert cached is None, f"kwargs_cache[{k}] should be None"
                 elif isinstance(v, torch.Tensor):
                     assert v.allclose(cached), f"kwargs_cache[{k}] should be the same as kwargs[{k}]"
+                elif isinstance(v, tuple):
+                    assert isinstance(cached, tuple), f"kwargs_cache[{k}] should be a tuple"
+                    assert len(v) == len(cached), f"kwargs_cache[{k}] should have the same length as kwargs[{k}]"
+                    for i, (vi, cachedi) in enumerate(zip(v, cached)):
+                        if isinstance(vi, torch.Tensor):
+                            assert vi.allclose(
+                                cachedi
+                            ), f"kwargs_cache[{k}][{i}] should be the same as kwargs[{k}][{i}]"
+                        else:
+                            assert vi == cachedi, f"kwargs_cache[{k}][{i}] should be the same as kwargs[{k}][{i}]"
                 else:
                     assert v == cached, f"kwargs_cache[{k}] should be the same as kwargs[{k}]"
         else:
@@ -167,29 +196,47 @@ class LlmCalibrationCache(CalibrationCache):
             Generator[torch.Tensor, None, None]: Generator for iterating over samples.
                 Each sample is a tensor of shape (1, seq_length).
         """
-        assert tokenizer is not None, "tokenizer is required for pileval dataset"
-
+        assert tokenizer is not None, "tokenizer is required for LLM calibration"
 
         # region custom dataset kompress
-        import os
-        import json
-        import logging
-        kompress_data_path = os.environ["KOMPRESS_DATA_PATH"]
-        with open(kompress_data_path, "r") as f:
-            kompress_data_dict = json.load(f)
-        logging.info(f"Loaded kompress data {kompress_data_dict} from {kompress_data_path}")
-        split = kompress_data_dict["split"]
-        dataset_name_or_path = kompress_data_dict["dataset_name_or_path"]
-        text_column = kompress_data_dict["text_column"]
-        dataset = load_from_disk(dataset_name_or_path)[split]
+        try:
+            import os
+            import json
+            import logging
+
+            kompress_data_path = os.environ["KOMPRESS_DATA_PATH"]
+            with open(kompress_data_path, "r") as f:
+                kompress_data_dict = json.load(f)
+            logging.info(f"Loaded kompress data {kompress_data_dict} from {kompress_data_path}")
+            split = kompress_data_dict["split"]
+            dataset_name_or_path = kompress_data_dict["dataset_name_or_path"]
+            text_column = kompress_data_dict["text_column"]
+            dataset = load_from_disk(dataset_name_or_path)[split]
         # endregion
+        except Exception as e:
+
+            logging.error(f"[ Couldn't load kompress data. ] Loading from config.dataset_path instead.")
+            # region dataset pileval
+            if self.config.data == "pileval":
+                dataset = load_dataset(self.config.dataset_path, split="validation")
+                text_column = "text"
+            elif self.config.data == "vlm_calibration_dataset":
+                self.__is_vlm_dataset = True
+                dataset = load_dataset("parquet", data_files=self.config.dataset_path, split="train")
+                text_column = "conversations"
+                image_column = "image_url"
+            else:
+                raise NotImplementedError(f"Calibration dataset {self.config.data} is not supported")
 
         dataset = dataset.shuffle(seed=42)
         rng = random.Random(42)
-        samples, num_tokens = [], 0
+        samples: list[CalibSample] = []
+        num_tokens = 0
         for _data in dataset:
             line = _data[text_column]
+            img = _data[image_column] if self.__is_vlm_dataset else None
             line = line.strip()
+            line = process_sample(line, self.__is_vlm_dataset)
             # line_encoded is a list of token ids
             line_encoded = tokenizer.encode(line)
             seq_length = len(line_encoded)
@@ -201,15 +248,26 @@ class LlmCalibrationCache(CalibrationCache):
                 continue
             # sample is a tensor of shape (1, seq_length)
             sample = torch.tensor([line_encoded])
+
             if seq_length > self.config.seq_length:
-                tok = rng.randint(0, seq_length - self.config.seq_length)
-                sample = sample[:, tok : tok + self.config.seq_length]
-            samples.append(sample)
+                if self.__is_vlm_dataset:
+                    sample = sample[:, : self.config.seq_length]
+                else:
+                    tok = rng.randint(0, seq_length - self.config.seq_length)
+                    sample = sample[:, tok : tok + self.config.seq_length]
+
+            samples.append(CalibSample(sample=sample, images=img))
             num_tokens += sample.shape[1]
             if len(samples) >= self.config.num_samples and num_tokens >= self.config.num_tokens:
                 break
-        # now concatenate all samples and split according to seq_length
-        samples = torch.cat(samples, dim=1).split(self.config.seq_length, dim=1)
+
+        samples = [
+            CalibSample(
+                sample=s[:, : self.config.seq_length],
+                images=img,
+            )
+            for s in torch.cat([sample.sample for sample in samples], dim=1).split(self.config.seq_length, dim=1)
+        ]
         if num_tokens > self.config.num_tokens:
             samples = samples[:-1]
         samples = samples[: self.config.num_samples]
@@ -266,36 +324,102 @@ class LlmCalibrationCache(CalibrationCache):
             model = model_struct.module
         else:
             model_struct = LlmModelStruct.build(model)
-        backbone_struct = model_struct.backbone_struct
-        layer_structs = backbone_struct.layer_structs
-        action = LlmConcatCache("cpu") if action is None else action
-        for layer_idx, (layer_name, (layer, layer_cache, layer_kwargs)) in enumerate(
-            self._iter_layer_activations(
-                model,
-                *args,
-                action=action,
-                layers=backbone_struct.layers,
-                needs_inputs_fn=needs_inputs_fn,
-                needs_outputs_fn=needs_outputs_fn,
-                needs_samples_caching=needs_samples_caching,
-                **kwargs,
-            )
-        ):
-            layer_struct = layer_structs[layer_idx]
-            assert layer_idx == layer_struct.idx
-            assert layer_name == layer_struct.full_name
-            assert layer is layer_struct.module
-            if layer_struct.proj_v_full_name in layer_cache:
-                cache = layer_cache[layer_struct.proj_v_full_name]
-                layer_cache[layer_struct.proj_q_full_name] = cache
-                layer_cache[layer_struct.proj_k_full_name] = cache
-            if layer_struct.proj_1st_full_names[0] in layer_cache:
-                for expert_idx in range(layer_struct.config.num_experts):
-                    cache = layer_cache[layer_struct.proj_1st_full_names[expert_idx]]
-                    for name in layer_struct.proj_1st_full_names[expert_idx :: layer_struct.config.num_experts]:
-                        layer_cache[name] = cache
-                if layer_struct.config.num_experts == 1 and layer_struct.ffn_block_full_name not in layer_cache:
-                    layer_cache[layer_struct.ffn_block_full_name] = layer_cache[layer_struct.proj_1st_full_names[0]]
-            if layer_struct.config.num_experts > 1 and layer_struct.ffn_block_full_name in layer_cache:
-                layer_cache[layer_struct.router_full_name] = layer_cache[layer_struct.ffn_block_full_name]
-            yield layer_name, (layer_struct, layer_cache, layer_kwargs)
+        backbone_structs = [model_struct.backbone_struct_llm]
+        if hasattr(model.config, "is_vlm") and model.config.is_vlm:
+            backbone_structs.insert(0, model_struct.backbone_struct_vit)
+            print(f"❗️ Quantizing VLM {model.config.is_vlm=}")
+
+        for backbone_struct in backbone_structs:
+            layer_structs = backbone_struct.layer_structs
+            action = LlmConcatCache("cpu") if action is None else action
+            for layer_idx, (
+                layer_name,
+                (layer, layer_cache, layer_kwargs),
+            ) in enumerate(
+                self._iter_layer_activations(
+                    model,
+                    *args,
+                    action=action,
+                    layers=backbone_struct.layers,
+                    needs_inputs_fn=needs_inputs_fn,
+                    needs_outputs_fn=needs_outputs_fn,
+                    needs_samples_caching=needs_samples_caching,
+                    **kwargs,
+                )
+            ):
+                layer_struct = layer_structs[layer_idx]
+                assert layer_idx == layer_struct.idx
+                assert layer_name == layer_struct.full_name, f"{layer_name} != {layer_struct.full_name}"
+                assert layer is layer_struct.module
+                if layer_struct.proj_v_full_name in layer_cache:
+                    cache = layer_cache[layer_struct.proj_v_full_name]
+                    layer_cache[layer_struct.proj_q_full_name] = cache
+                    layer_cache[layer_struct.proj_k_full_name] = cache
+                if layer_struct.proj_1st_full_names[0] in layer_cache:
+                    for expert_idx in range(layer_struct.config.num_experts):
+                        cache = layer_cache[layer_struct.proj_1st_full_names[expert_idx]]
+                        for name in layer_struct.proj_1st_full_names[expert_idx :: layer_struct.config.num_experts]:
+                            layer_cache[name] = cache
+                    if layer_struct.config.num_experts == 1 and layer_struct.ffn_block_full_name not in layer_cache:
+                        layer_cache[layer_struct.ffn_block_full_name] = layer_cache[layer_struct.proj_1st_full_names[0]]
+                if layer_struct.config.num_experts > 1 and layer_struct.ffn_block_full_name in layer_cache:
+                    layer_cache[layer_struct.router_full_name] = layer_cache[layer_struct.ffn_block_full_name]
+                yield layer_name, (layer_struct, layer_cache, layer_kwargs)
+
+
+class VLMCalibrationDataset(Dataset):
+    def __init__(self, config, tokenizer, model, device=None, dtype=None):
+        self.config = config
+        self.tokenizer = tokenizer
+        self.model = model
+        self.device = device if device is not None else model.device
+        self.dtype = dtype if dtype is not None else model.dtype
+        self.dataset = load_dataset("parquet", data_files=config.dataset_path, split="train")
+        self.dataset = self.dataset.shuffle(seed=42)
+
+    def __len__(self):
+        return min(len(self.dataset), self.config.num_samples)
+
+    def move_sample(self, sample):
+        if self.device is None and self.dtype is None:
+            return sample
+
+        if self.device is not None and self.dtype is not None:
+            sample.to(device=self.device, dtype=self.dtype)
+
+        if self.device is not None:
+            return sample.to(device=self.device)
+        elif self.dtype is not None:
+            return sample.to(dtype=self.dtype)
+
+    def __getitem__(self, idx):
+        data = self.dataset[idx]
+        text = data["conversations"]
+        image_url = data["image_url"]
+
+        # Process the sample
+        text = text.strip()
+        text = process_sample(text, is_vlm=True)
+
+        # Tokenize
+        encoded = self.tokenizer.encode(text, truncation=True, max_length=self.config.seq_length)
+        input_ids = torch.tensor(encoded)
+
+        # Pad or truncate to seq_length
+        if len(input_ids) < self.config.seq_length:
+            input_ids = torch.nn.functional.pad(input_ids, (0, self.config.seq_length - len(input_ids)))
+        elif len(input_ids) > self.config.seq_length:
+            input_ids = input_ids[: self.config.seq_length]
+
+        sample: CalibSample = CalibSample(sample=input_ids, images=image_url)
+
+        return {
+            "input_ids": self.move_sample(sample.sample),
+            "images": self.move_sample(sample.image_tensors(self.model)),
+        }
+
+
+def create_vlm_dataloader(config, tokenizer, model):
+    dataset = VLMCalibrationDataset(config, tokenizer, model)
+    dataloader = DataLoader(dataset, batch_size=1, shuffle=True)
+    return dataloader

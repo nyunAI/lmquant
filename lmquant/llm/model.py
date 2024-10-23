@@ -3,6 +3,7 @@
 
 from dataclasses import dataclass, field
 
+import os
 import torch
 from omniconfig import configclass
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
@@ -54,11 +55,17 @@ class LlmModelConfig(BaseModelConfig):
         Returns:
             tuple[AutoModelForCausalLM, AutoTokenizer]: Model and tokenizer.
         """
-        config = AutoConfig.from_pretrained(self.path)
-        tokenizer = AutoTokenizer.from_pretrained(self.path)
+        trust_remote_code = eval(os.environ.get("HUGGINGFACE_TRUST_REMOTE_CODE", "False"))
+        config = AutoConfig.from_pretrained(self.path, trust_remote_code=trust_remote_code)
+        tokenizer = AutoTokenizer.from_pretrained(self.path, trust_remote_code=trust_remote_code)
         kwargs = {} if cpu else {"device_map": "balanced"}
         kwargs["torch_dtype"] = dtype
-        model = AutoModelForCausalLM.from_pretrained(self.path, config=config, **kwargs)
+        model = AutoModelForCausalLM.from_pretrained(
+            self.path, config=config, trust_remote_code=trust_remote_code, **kwargs
+        )
         patch_attention(model)
         model.eval()
+        if self.is_vlm:
+            assert hasattr(model, "config"), "The model does not have config."
+            setattr(model.config, "is_vlm", True)
         return model, tokenizer

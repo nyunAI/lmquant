@@ -44,6 +44,7 @@ from transformers.models.opt.modeling_opt import (
 )
 from transformers.models.qwen2.modeling_qwen2 import (
     Qwen2Attention,
+    Qwen2SdpaAttention,
     Qwen2Config,
     Qwen2DecoderLayer,
     Qwen2ForCausalLM,
@@ -51,6 +52,39 @@ from transformers.models.qwen2.modeling_qwen2 import (
     Qwen2MLP,
     Qwen2Model,
 )
+
+# LlavaQwen2
+LlavaQwen2Attention = [Qwen2Attention, Qwen2SdpaAttention]
+LlavaQwen2DecoderLayer = Qwen2DecoderLayer
+LlavaQwen2MLP = Qwen2MLP
+
+
+from transformers import PretrainedConfig
+
+
+def object_like(obj: object, *class_or_name: tp.Union[str, type]) -> bool:
+    try:
+        if isinstance(class_or_name[0], tp.Tuple):
+            class_or_name = class_or_name[0]
+    except IndexError:
+        assert all(isinstance(x, (str, type)) for x in class_or_name), f"{class_or_name=}"
+
+    class_or_name += tuple(cls.__name__ for cls in list(filter(lambda x: isinstance(x, type), class_or_name)))
+
+    object_is_class_or_name: tp.Callable[[tp.Union[str, type]], bool] = lambda x: (
+        x == obj.__class__.__name__
+        if isinstance(x, str)
+        else isinstance(obj, x) or x.__name__ == obj.__class__.__name__
+    )
+    return any(object_is_class_or_name(x) for x in class_or_name)
+
+
+module_like: tp.Callable[[nn.Module, tp.Union[str, type]], bool] = object_like
+"""Check if a module is like the given class or name."""
+
+config_like: tp.Callable[[PretrainedConfig, tp.Union[str, type]], bool] = object_like
+"""Check if a config is like the given class or name."""
+
 
 __all__ = ["LlmModelStruct", "LlmDecoderLayerStruct", "LlmBackboneStruct"]
 
@@ -122,30 +156,54 @@ class LlmModelStruct:
 
     module: nn.Module
     """the nn.Module of the model"""
-    backbone: nn.Module
+    backbone_llm: nn.Module
+    backbone_vit: nn.Module
     fc: nn.Linear | None
-    backbone_name: str
+    backbone_name_llm: str
+    backbone_name_vit: str
     fc_name: str
     config: LlmConfigStruct
 
-    _backbone_struct: tp.Optional["LlmBackboneStruct"] = None
+    _backbone_struct_llm: tp.Optional["LlmBackboneStruct"] = None
+    _backbone_struct_vit: tp.Optional["LlmBackboneStruct"] = None
 
     @property
-    def backbone_full_name(self) -> str:
+    def backbone_full_name_llm(self) -> str:
         """Get the backbone full name."""
-        return self.backbone_name
+        return self.backbone_name_llm
+
+    @property
+    def backbone_full_name_vit(self) -> str:
+        """Get the backbone full name."""
+        return self.backbone_name_vit
 
     @property
     def fc_full_name(self) -> str:
         """Get the fc full name."""
         return self.fc_name
 
+    # For backward compatibility
     @property
     def backbone_struct(self) -> "LlmBackboneStruct":
         """Extract backbone."""
-        if self._backbone_struct is None:
-            self._backbone_struct = extract_llm_backbone(self.backbone, self)
-        return self._backbone_struct
+        print(
+            f"[WARNING] LlmModelStruct.backbone_struct will be deprecated. Use backbone_struct_llm or backbone_struct_vit instead."
+        )
+        return self.backbone_struct_llm
+
+    @property
+    def backbone_struct_llm(self) -> "LlmBackboneStruct":
+        """Extract backbone."""
+        if self._backbone_struct_llm is None:
+            self._backbone_struct_llm = extract_llm_backbone(self.backbone_llm, self.backbone_full_name_llm, self)
+        return self._backbone_struct_llm
+
+    @property
+    def backbone_struct_vit(self) -> "LlmBackboneStruct":
+        """Extract backbone."""
+        if self._backbone_struct_vit is None:
+            self._backbone_struct_vit = extract_llm_backbone(self.backbone_vit, self.backbone_full_name_vit, self)
+        return self._backbone_struct_vit
 
     @staticmethod
     def build(model: nn.Module) -> tp.Optional["LlmModelStruct"]:
@@ -176,7 +234,7 @@ class LlmBackboneStruct:
     layers_name: str
     final_ln_name: str
     proj_out_name: str
-    full_name: str = field(init=False)
+    full_name: str
     embedding_full_names: list[str] = field(init=False)
     proj_in_full_name: str = field(init=False)
     first_ln_full_name: str = field(init=False)
@@ -188,7 +246,6 @@ class LlmBackboneStruct:
     _layer_structs: list["LlmDecoderLayerStruct"] | None = None
 
     def __post_init__(self) -> None:
-        self.full_name = self.parent.backbone_full_name
         self.embedding_full_names = [f"{self.full_name}.{name}" for name in self.embedding_names]
         self.proj_in_full_name = f"{self.full_name}.{self.proj_in_name}"
         self.first_ln_full_name = f"{self.full_name}.{self.first_ln_name}"
@@ -406,10 +463,18 @@ class LlmDecoderLayerStruct:
 
 def extract_llm(model: nn.Module) -> LlmModelStruct | None:
     """Extract llm into components."""
-    if isinstance(model, (OPTForCausalLM, OPTForSequenceClassification, OPTForQuestionAnswering)):
+    if module_like(model, "LlavaQwen2ForCausalLM"):
+        model.model.vision_tower.load_model()
+        model.model.vision_tower.to(device=model.model.device)
+        backbone_vit = model.model.vision_tower.vision_tower.vision_model
+        backbone_name_vit = "model.vision_tower.vision_tower.vision_model"
+        backbone_llm = model.model
+        backbone_name_llm = "model"
+    # region model
+    elif module_like(model, (OPTForCausalLM, OPTForSequenceClassification, OPTForQuestionAnswering)):
         backbone = model.model.decoder
         backbone_name = "model.decoder"
-    elif isinstance(
+    elif module_like(
         model,
         (
             LlamaForCausalLM,
@@ -426,13 +491,26 @@ def extract_llm(model: nn.Module) -> LlmModelStruct | None:
         backbone_name = "model"
     else:
         raise ValueError(f"Unsupported model type: {type(model)}")
-    if isinstance(model, (OPTForCausalLM, LlamaForCausalLM, MistralForCausalLM, MixtralForCausalLM, Qwen2ForCausalLM)):
+    # endregion
+
+    # region fc
+    if module_like(
+        model,
+        (
+            OPTForCausalLM,
+            LlamaForCausalLM,
+            MistralForCausalLM,
+            MixtralForCausalLM,
+            Qwen2ForCausalLM,
+            "LlavaQwen2ForCausalLM",
+        ),
+    ):
         fc = model.lm_head
         fc_name = "lm_head"
-    elif isinstance(model, (OPTForQuestionAnswering)):
+    elif module_like(model, (OPTForQuestionAnswering)):
         fc = model.qa_outputs
         fc_name = "qa_outputs"
-    elif isinstance(
+    elif module_like(
         model,
         (
             OPTForSequenceClassification,
@@ -446,8 +524,11 @@ def extract_llm(model: nn.Module) -> LlmModelStruct | None:
         fc_name = "score"
     else:
         raise ValueError(f"Unsupported model type: {type(model)}")
+    # endregion
+
+    # region config
     config = model.config
-    if isinstance(config, OPTConfig):
+    if config_like(config, OPTConfig):
         config_struct = LlmConfigStruct(
             vocab_size=config.vocab_size,
             hidden_size=config.hidden_size,
@@ -461,12 +542,23 @@ def extract_llm(model: nn.Module) -> LlmModelStruct | None:
             do_norm_before=config.do_layer_norm_before,
             tie_word_embeddings=config.tie_word_embeddings,
         )
-    elif isinstance(config, (LlamaConfig, MistralConfig, MixtralConfig, Qwen2Config)):
+    elif config_like(
+        config,
+        (
+            LlamaConfig,
+            MistralConfig,
+            MixtralConfig,
+            Qwen2Config,
+            "LlavaQwen2Config",
+        ),
+    ):
+        hidden_act_key = "hidden_act"
+        assert hasattr(config, hidden_act_key), f"{hidden_act_key} not found in {type(config)}"
         config_struct = LlmConfigStruct(
             vocab_size=config.vocab_size,
             hidden_size=config.hidden_size,
             intermediate_size=config.intermediate_size,
-            intermediate_act=config.hidden_act,
+            intermediate_act=getattr(config, hidden_act_key),
             num_hidden_layers=config.num_hidden_layers,
             num_attention_heads=config.num_attention_heads,
             num_key_value_heads=config.num_key_value_heads,
@@ -477,21 +569,26 @@ def extract_llm(model: nn.Module) -> LlmModelStruct | None:
         )
     else:
         raise ValueError(f"Unsupported config type: {type(config)}")
+    # endregion
+
     return LlmModelStruct(
         module=model,
-        backbone=backbone,
+        backbone_llm=backbone_llm,
+        backbone_vit=backbone_vit,
         fc=fc,
-        backbone_name=backbone_name,
+        backbone_name_llm=backbone_name_llm,
+        backbone_name_vit=backbone_name_vit,
         fc_name=fc_name,
         config=config_struct,
     )
 
 
-def extract_llm_backbone(backbone: nn.Module, parent: LlmModelStruct) -> LlmBackboneStruct | None:
+def extract_llm_backbone(backbone: nn.Module, full_name: str, parent: LlmModelStruct) -> LlmBackboneStruct | None:
     """Extract llm backbone into components."""
-    if isinstance(backbone, OPTModel):
+    # region backbone
+    if module_like(backbone, OPTModel):
         backbone = backbone.decoder
-    if isinstance(backbone, OPTDecoder):
+    if module_like(backbone, OPTDecoder):
         embeddings = [backbone.embed_tokens, backbone.embed_positions]
         layers = backbone.layers
         first_ln, final_ln = None, backbone.final_layer_norm
@@ -500,7 +597,16 @@ def extract_llm_backbone(backbone: nn.Module, parent: LlmModelStruct) -> LlmBack
         layers_name = "layers"
         first_ln_name, final_ln_name = "", "final_layer_norm"
         proj_in_name, proj_out_name = "project_in", "project_out"
-    elif isinstance(backbone, (LlamaModel, MistralModel, MixtralModel, Qwen2Model)):
+    elif module_like(
+        backbone,
+        (
+            LlamaModel,
+            MistralModel,
+            MixtralModel,
+            Qwen2Model,
+            "LlavaQwen2Model",
+        ),
+    ):
         embeddings = [backbone.embed_tokens]
         layers = backbone.layers
         first_ln, final_ln = None, backbone.norm
@@ -509,8 +615,19 @@ def extract_llm_backbone(backbone: nn.Module, parent: LlmModelStruct) -> LlmBack
         layers_name = "layers"
         first_ln_name, final_ln_name = "", "norm"
         proj_in_name, proj_out_name = "", ""
+    elif module_like(backbone, "SigLipVisionTransformer"):
+        embeddings = [backbone.embeddings]
+        layers = backbone.encoder.layers
+        first_ln, final_ln = None, backbone.post_layernorm
+        proj_in, proj_out = None, None
+        embedding_names = ["embeddings"]
+        layers_name = "encoder.layers"
+        first_ln_name, final_ln_name = "", "post_layernorm"
+        proj_in_name, proj_out_name = "", ""
     else:
         raise ValueError(f"Unsupported backbone type: {type(backbone)}")
+    # endregion
+
     return LlmBackboneStruct(
         module=backbone,
         parent=parent,
@@ -526,6 +643,7 @@ def extract_llm_backbone(backbone: nn.Module, parent: LlmModelStruct) -> LlmBack
         layers_name=layers_name,
         final_ln_name=final_ln_name,
         proj_out_name=proj_out_name,
+        full_name=full_name,
     )
 
 
@@ -538,10 +656,43 @@ def extract_llm_layer(layer: nn.Module, layer_idx: int, parent: LlmBackboneStruc
     Returns:
         LlmBlockStruct: Block.
     """
-    if isinstance(layer, OPTDecoderLayer):
+    # region decoder layer
+    if module_like(layer, "SigLipEncoderLayer"):
+        attn_ln = layer.layer_norm1
+        attn_block = layer.self_attn
+        assert module_like(
+            attn_block,
+            "SigLipAttention",
+        )
+        ffn_ln_key = "layer_norm2"
+        ffn_ln = getattr(layer, ffn_ln_key)
+        ffn_block = layer.mlp
+        assert module_like(ffn_block, "SigLipMLP")
+        proj_qkv = [attn_block.q_proj, attn_block.k_proj, attn_block.v_proj]
+        proj_out = attn_block.out_proj
+        proj_1st = [ffn_block.fc1]
+        proj_2nd = [ffn_block.fc2]
+        experts = [ffn_block]
+        router = None
+        proj_2nd_lowerbound = None
+        attn_block_kwargs = (
+            "attention_mask",
+            "output_attentions",
+        )
+        attn_ln_name = "layer_norm1"
+        attn_block_name = "self_attn"
+        proj_qkv_names = ["q_proj", "k_proj", "v_proj"]
+        proj_out_name = "out_proj"
+        ffn_ln_name = ffn_ln_key
+        ffn_block_name = "mlp"
+        proj_1st_names = ["fc1"]
+        proj_2nd_name = "fc2"
+        experts_name = ""
+        router_name = ""
+    elif module_like(layer, OPTDecoderLayer):
         attn_ln = layer.self_attn_layer_norm
         attn_block = layer.self_attn
-        assert isinstance(attn_block, OPTAttention)
+        assert module_like(attn_block, OPTAttention)
         ffn_ln = layer.final_layer_norm
         ffn_block = nn.Sequential(layer.fc1, layer.activation_fn, layer.fc2)
         proj_qkv = [attn_block.q_proj, attn_block.k_proj, attn_block.v_proj]
@@ -568,13 +719,31 @@ def extract_llm_layer(layer: nn.Module, layer_idx: int, parent: LlmBackboneStruc
         proj_2nd_name = "fc2"
         experts_name = ""
         router_name = ""
-    elif isinstance(layer, (LlamaDecoderLayer, MistralDecoderLayer, Qwen2DecoderLayer)):
+    elif module_like(
+        layer,
+        (
+            LlamaDecoderLayer,
+            MistralDecoderLayer,
+            Qwen2DecoderLayer,
+            LlavaQwen2DecoderLayer,
+        ),
+    ):
         attn_ln = layer.input_layernorm
         attn_block = layer.self_attn
-        assert isinstance(attn_block, (LlamaAttention, MistralAttention, Qwen2Attention))
-        ffn_ln = layer.post_attention_layernorm
+        assert module_like(
+            attn_block,
+            (
+                LlamaAttention,
+                MistralAttention,
+                Qwen2Attention,
+                *LlavaQwen2Attention,
+            ),
+        ), f"{type(attn_block)=}"
+        ffn_ln_key = "post_attention_layernorm"
+        assert hasattr(layer, ffn_ln_key), f"{ffn_ln_key} not found in {type(layer)}"
+        ffn_ln = getattr(layer, ffn_ln_key)
         ffn_block = layer.mlp
-        assert isinstance(ffn_block, (LlamaMLP, MistralMLP, Qwen2MLP))
+        assert module_like(ffn_block, (LlamaMLP, MistralMLP, Qwen2MLP, LlavaQwen2MLP))
         proj_qkv = [attn_block.q_proj, attn_block.k_proj, attn_block.v_proj]
         proj_out = attn_block.o_proj
         proj_1st = [ffn_block.up_proj, ffn_block.gate_proj]
@@ -590,25 +759,25 @@ def extract_llm_layer(layer: nn.Module, layer_idx: int, parent: LlmBackboneStruc
             "use_cache",
             "cache_position",
         )
-        if not isinstance(layer, LlamaDecoderLayer):
+        if not module_like(layer, LlamaDecoderLayer):
             attn_block_kwargs = attn_block_kwargs[:-1]
         attn_ln_name = "input_layernorm"
         attn_block_name = "self_attn"
         proj_qkv_names = ["q_proj", "k_proj", "v_proj"]
         proj_out_name = "o_proj"
-        ffn_ln_name = "post_attention_layernorm"
+        ffn_ln_name = ffn_ln_key
         ffn_block_name = "mlp"
         proj_1st_names = ["up_proj", "gate_proj"]
         proj_2nd_name = "down_proj"
         experts_name = ""
         router_name = ""
-    elif isinstance(layer, MixtralDecoderLayer):
+    elif module_like(layer, MixtralDecoderLayer):
         attn_ln = layer.input_layernorm
         attn_block = layer.self_attn
-        assert isinstance(attn_block, MixtralAttention)
+        assert module_like(attn_block, MixtralAttention)
         ffn_ln = layer.post_attention_layernorm
         ffn_block = layer.block_sparse_moe
-        assert isinstance(ffn_block, MixtralSparseMoeBlock)
+        assert module_like(ffn_block, MixtralSparseMoeBlock)
         proj_qkv = [attn_block.q_proj, attn_block.k_proj, attn_block.v_proj]
         proj_out = attn_block.o_proj
         proj_1st = [expert.w3 for expert in ffn_block.experts] + [expert.w1 for expert in ffn_block.experts]
@@ -616,7 +785,13 @@ def extract_llm_layer(layer: nn.Module, layer_idx: int, parent: LlmBackboneStruc
         experts = [expert for expert in ffn_block.experts]
         router = ffn_block.gate
         proj_2nd_lowerbound = None
-        attn_block_kwargs = ("attention_mask", "position_ids", "past_key_value", "output_attentions", "use_cache")
+        attn_block_kwargs = (
+            "attention_mask",
+            "position_ids",
+            "past_key_value",
+            "output_attentions",
+            "use_cache",
+        )
         attn_ln_name = "input_layernorm"
         attn_block_name = "self_attn"
         proj_qkv_names = ["q_proj", "k_proj", "v_proj"]
@@ -629,6 +804,8 @@ def extract_llm_layer(layer: nn.Module, layer_idx: int, parent: LlmBackboneStruc
         router_name = "gate"
     else:
         raise ValueError(f"Unsupported layer type: {type(layer)}")
+    # endregion
+
     return LlmDecoderLayerStruct(
         module=layer,
         parent=parent,

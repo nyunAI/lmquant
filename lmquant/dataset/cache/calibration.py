@@ -3,6 +3,7 @@
 
 import functools
 import gc
+import os
 import typing as tp
 from abc import ABC, abstractmethod
 
@@ -10,7 +11,9 @@ import psutil
 import torch
 import torch.nn as nn
 import torch.utils.hooks
+from PIL import Image
 from tqdm import tqdm
+from dataclasses import dataclass
 from tqdm.contrib.logging import logging_redirect_tqdm
 
 from ..config import BaseCalibDatasetConfig
@@ -19,6 +22,22 @@ from .action import CacheAction
 from .activation import ActivationCache, IOActivationsCache
 
 __all__ = ["CalibrationCache"]
+
+
+@dataclass
+class CalibSample:
+    """Calibration sample."""
+
+    sample: torch.Tensor
+    images: str | None = None
+
+    def image_tensors(self, model: torch.nn.Module) -> list[torch.Tensor]:
+        """Get image tensor."""
+        assert hasattr(model, "process_images"), "Expecting a VLM with `process_images` method"
+        # TODO: remove prefix
+        prefix = "/home/azureuser/shwu/edge/Amazon-VLM/custom_datasets/pretraining"
+        image = Image.open(os.path.join(prefix, self.images)).convert("RGB")
+        return model.process_images([image], model.config)
 
 
 class CalibrationCache(ABC):
@@ -31,7 +50,7 @@ class CalibrationCache(ABC):
             config (BaseCalibrationConfig): Configuration for caching calibration dataset.
         """
         self.config = config
-        self.cached_samples: list[torch.Tensor] = []
+        self.cached_samples: list[CalibSample] = []
 
     @property
     def num_samples(self) -> int:
@@ -43,18 +62,18 @@ class CalibrationCache(ABC):
         self.cached_samples = []
 
     @abstractmethod
-    def _iter_samples(self, *args, **kwargs) -> tp.Generator[torch.Tensor, None, None]:
+    def _iter_samples(self, *args, **kwargs) -> tp.Generator[CalibSample, None, None]:
         """Iterate over model inputs."""
         ...
 
-    def iter_samples(self, *args, needs_caching: bool, **kwargs) -> tp.Generator[torch.Tensor, None, None]:
+    def iter_samples(self, *args, needs_caching: bool, **kwargs) -> tp.Generator[CalibSample, None, None]:
         """Iterate over model input samples.
 
         Args:
             needs_caching (bool): Whether to cache input samples.
 
         Yields:
-            Generator[torch.Tensor, None, None]: Generator of model input samples.
+            Generator[CalibSample, None, None]: Generator of model input samples.
         """
         if needs_caching and len(self.cached_samples) > 0:
             for sample in self.cached_samples:
@@ -65,14 +84,14 @@ class CalibrationCache(ABC):
                     self.cached_samples.append(sample)
                 yield sample
 
-    def get_samples(self, *args, needs_caching: bool, **kwargs) -> list[torch.Tensor]:
+    def get_samples(self, *args, needs_caching: bool, **kwargs) -> list[CalibSample]:
         """Get model input samples.
 
         Args:
             needs_caching (bool): Whether to cache input samples.
 
         Returns:
-            list[torch.Tensor]: List of model input samples.
+            list[CalibSample]: List of model input samples.
         """
         if needs_caching:
             if len(self.cached_samples) == 0:
@@ -101,7 +120,8 @@ class CalibrationCache(ABC):
         elif isinstance(m, (nn.Conv1d, nn.Conv2d, nn.Conv3d)):
             return IOActivationsCache(
                 inputs=ActivationCache(
-                    channels_dim=1, transform=ConvTransformFn(m.kernel_size, m.padding, m.stride, m.dilation)
+                    channels_dim=1,
+                    transform=ConvTransformFn(m.kernel_size, m.padding, m.stride, m.dilation),
                 ),
                 outputs=ActivationCache(channels_dim=1, transform=LinearTransformFn()),
             )
@@ -114,7 +134,7 @@ class CalibrationCache(ABC):
         args: tuple[torch.Tensor, ...],
         args_cache: list[tuple[torch.Tensor]],
     ) -> None:
-        assert all(isinstance(x, torch.Tensor) for x in args)
+        assert all(isinstance(x, torch.Tensor) for x in args), "Not all positional arguments are tensors."
         args_cache.append(tuple(x.detach().cpu() for x in args))
 
     def _pre_layer_kwargs_hook(
@@ -211,7 +231,10 @@ class CalibrationCache(ABC):
                 layer_kwargs_caches[layer_name] = {}
                 layer_hooks.append(
                     module.register_forward_pre_hook(
-                        functools.partial(self._pre_layer_kwargs_hook, kwargs_cache=layer_kwargs_caches[layer_name]),
+                        functools.partial(
+                            self._pre_layer_kwargs_hook,
+                            kwargs_cache=layer_kwargs_caches[layer_name],
+                        ),
                         with_kwargs=True,
                     )
                 )
@@ -248,7 +271,16 @@ class CalibrationCache(ABC):
                     leave=False,
                     total=self.num_samples,
                 ):
-                    model(sample.to(device=device))
+                    if isinstance(sample, CalibSample):
+                        if sample.images is not None:
+                            model(
+                                input_ids=sample.sample.to(device=device),
+                                images=sample.image_tensors(model).to(dtype=model.dtype).to(device=device),
+                            )
+                        else:
+                            model(input_ids=sample.sample.to(device=device))
+                    else:
+                        model(sample.to(device=device))
                     if psutil.virtual_memory().percent > 90:
                         raise RuntimeError("memory usage > 90%%, aborting")
             for hook in layer_hooks:
@@ -280,7 +312,9 @@ class CalibrationCache(ABC):
                     next_layer_args_cache: list[list[torch.Tensor]] = []
                     layer_kwargs = layer_kwargs_caches[layer_name]
                     for layer_args in tqdm(
-                        layer_args_cache, desc=f"collecting calibration activations in {layer_name}", leave=False
+                        layer_args_cache,
+                        desc=f"collecting calibration activations in {layer_name}",
+                        leave=False,
                     ):
                         num_args = len(layer_args)
                         layer_args = [arg.to(device=device) for arg in layer_args]

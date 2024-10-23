@@ -22,6 +22,7 @@ class BaseModelConfig(ABC):
         root (str): Root directory path for models. Defaults to ``""``.
         local_path (str): Local path of the model. Defaults to ``None``.
         local_root (str): Local root directory path for models. Defaults to ``""``.
+        is_vlm (bool): Whether the model is a Vision Language Model. Defaults to ``False``.
     """
 
     name: str
@@ -29,6 +30,7 @@ class BaseModelConfig(ABC):
     root: str = ""
     local_path: str = None
     local_root: str = ""
+    is_vlm: bool = False
     family: str = field(init=False)
 
     def __post_init__(self):

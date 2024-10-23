@@ -167,6 +167,15 @@ class LlmModelStruct:
     _backbone_struct_llm: tp.Optional["LlmBackboneStruct"] = None
     _backbone_struct_vit: tp.Optional["LlmBackboneStruct"] = None
 
+    # For backward compatibility
+    @property
+    def backbone_full_name(self) -> str:
+        """Get the backbone full name."""
+        print(
+            f"[WARNING] LlmModelStruct.backbone_full_name will be deprecated. Use backbone_full_name_llm or backbone_full_name_vit instead."
+        )
+        return self.backbone_name_llm
+
     @property
     def backbone_full_name_llm(self) -> str:
         """Get the backbone full name."""

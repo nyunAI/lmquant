@@ -3,9 +3,10 @@
 
 from dataclasses import dataclass, field
 
+import os
 import torch
 from omniconfig import configclass
-from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, AutoProcessor
 
 from lmquant.model.config import BaseModelConfig
 
@@ -54,11 +55,24 @@ class LlmModelConfig(BaseModelConfig):
         Returns:
             tuple[AutoModelForCausalLM, AutoTokenizer]: Model and tokenizer.
         """
-        config = AutoConfig.from_pretrained(self.path)
-        tokenizer = AutoTokenizer.from_pretrained(self.path)
+        trust_remote_code = eval(os.environ.get("HUGGINGFACE_TRUST_REMOTE_CODE", "False"))
+        config = AutoConfig.from_pretrained(self.path, trust_remote_code=trust_remote_code)
+        tokenizer = AutoTokenizer.from_pretrained(self.path, trust_remote_code=trust_remote_code)
         kwargs = {} if cpu else {"device_map": "balanced"}
         kwargs["torch_dtype"] = dtype
-        model = AutoModelForCausalLM.from_pretrained(self.path, config=config, **kwargs)
+        model = AutoModelForCausalLM.from_pretrained(
+            self.path, config=config, trust_remote_code=trust_remote_code, **kwargs
+        )
+        if self.is_vlm:
+            assert hasattr(model, "config"), "The model does not have config."
+            setattr(model.config, "is_vlm", True)
+
+        assert hasattr(model, "process_inputs"), "The model does not have process_inputs."
+        if hasattr(model, "init_processor"):
+            model.init_processor(
+                AutoProcessor.from_pretrained(model.config.image_encoder).image_processor,
+                tokenizer,
+            )
         patch_attention(model)
         model.eval()
         return model, tokenizer

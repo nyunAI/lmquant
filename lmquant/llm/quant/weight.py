@@ -194,14 +194,19 @@ def quantize_llm_weights(
                 quantizers.update(block_quantizers)
                 scale_state_dict.update(block_state_dict)
     else:
-        for layer in model.backbone_struct.layer_structs:
-            block_quantizers, block_state_dict = quantize_llm_decoder_layer_weights(
-                layer=layer,
-                config=quant_config,
-                quant_cache=quant_cache,
-                return_with_quantizers=return_with_quantizers,
-                return_with_scale_state_dict=return_with_scale_state_dict,
-            )
-            quantizers.update(block_quantizers)
-            scale_state_dict.update(block_state_dict)
+        backbone_structs = [model.backbone_struct_llm]
+        if hasattr(model.module.config, "is_vlm") and model.module.config.is_vlm:
+            backbone_structs.insert(0, model.backbone_struct_vit)
+            print(f"❗️ Quantizing VLM {model.module.config.is_vlm=}")
+        for backbone_struct in backbone_structs:
+            for layer in backbone_struct.layer_structs:
+                block_quantizers, block_state_dict = quantize_llm_decoder_layer_weights(
+                    layer=layer,
+                    config=quant_config,
+                    quant_cache=quant_cache,
+                    return_with_quantizers=return_with_quantizers,
+                    return_with_scale_state_dict=return_with_scale_state_dict,
+                )
+                quantizers.update(block_quantizers)
+                scale_state_dict.update(block_state_dict)
     return quant_cache, quantizers, scale_state_dict

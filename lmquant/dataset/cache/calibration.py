@@ -4,6 +4,7 @@
 import functools
 import gc
 import os
+import uuid
 import typing as tp
 from abc import ABC, abstractmethod
 
@@ -23,6 +24,8 @@ from .activation import ActivationCache, IOActivationsCache
 
 __all__ = ["CalibrationCache"]
 
+GLOBAL_CALIB_CACHE: tp.Dict[str, tp.Dict[str, tp.Any]] = {}
+
 
 @dataclass
 class CalibSample:
@@ -31,6 +34,7 @@ class CalibSample:
     text: str
     sample: torch.Tensor
     image_srcs: tp.List[str] | None = None
+    id: str = str(uuid.uuid4())
 
     def images(self, model: torch.nn.Module) -> tp.List[Image.Image]:
         """Get images."""
@@ -39,20 +43,24 @@ class CalibSample:
     def image_tensors(self, model: torch.nn.Module) -> list[torch.Tensor]:
         """Get image tensor."""
         assert hasattr(model, "process_images"), "Expecting a VLM with `process_images` method"
-        # TODO: remove prefix
         return model.process_images(self.images(model), model.config)
 
     def get_model_inputs(self, model: torch.nn.Module) -> dict[str, torch.Tensor]:
         """Process the calibration sample for the model."""
-        PROCESS_INPUTS_DOC = (
-            f" `model.process_inputs` should expect the following arguments:\n"
-            f" `sample` (torch.Tensor): The input tensor for the model.\n"
-            f" `images` (tp.List[str] | None): The path to the image file(s). Defaults to `None`.\n"
-        )
-
-        assert hasattr(model, "process_inputs"), PROCESS_INPUTS_DOC
-        model_inputs = model.process_inputs(self.text, self.images(model))
-        return {k: self.move_to_device(v, next(model.parameters()).device) for k, v in model_inputs.items()}
+        global GLOBAL_CALIB_CACHE
+        if GLOBAL_CALIB_CACHE.get(self.id):
+            model_inputs = GLOBAL_CALIB_CACHE[self.id]
+        else:
+            PROCESS_INPUTS_DOC = (
+                f" `model.process_inputs` should expect the following arguments:\n"
+                f" `sample` (torch.Tensor): The input tensor for the model.\n"
+                f" `images` (tp.List[str] | None): The path to the image file(s). Defaults to `None`.\n"
+            )
+            assert hasattr(model, "process_inputs"), PROCESS_INPUTS_DOC
+            model_inputs = model.process_inputs(self.text, self.images(model))
+            GLOBAL_CALIB_CACHE[self.id] = model_inputs
+        model_inputs = {k: self.move_to_device(v, next(model.parameters()).device) for k, v in model_inputs.items()}
+        return model_inputs
 
     def move_to_device(self, x: tp.Any, device: torch.device) -> None:
         """Move the sample to a device."""

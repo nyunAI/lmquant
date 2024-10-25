@@ -507,7 +507,7 @@ def extract_llm(model: nn.Module) -> LlmModelStruct | None:
         backbone_vit = model.image_encoder.vision_model
         backbone_name_vit = "image_encoder.vision_model"
         backbone_llm = model.language_model.model
-        backbone_name_llm = "model.language_model.model"
+        backbone_name_llm = "language_model.model"
     elif module_like(model, (OPTForCausalLM, OPTForSequenceClassification, OPTForQuestionAnswering)):
         backbone_llm = model.model.decoder
         backbone_name_llm = "model.decoder"

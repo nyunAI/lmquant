@@ -58,6 +58,29 @@ LlavaQwen2Attention = [Qwen2Attention, Qwen2SdpaAttention]
 LlavaQwen2DecoderLayer = Qwen2DecoderLayer
 LlavaQwen2MLP = Qwen2MLP
 
+# Siglip
+SiglipVisionTransformer = [
+    "SigLipVisionTransformer",  # NanoLLaVA modeling
+    "SiglipVisionTransformer",  # Dragonfly modeling
+]
+SiglipEncoderLayer = [
+    "SigLipEncoderLayer",  # NanoLLaVA modeling
+    "SiglipEncoderLayer",  # Dragonfly modeling
+]
+SiglipSdpaAttention = [
+    "SigLipSdpaAttention",  # NanoLLaVA modeling
+    "SiglipSdpaAttention",  # Dragonfly modeling
+]
+SiglipAttention = [
+    "SigLipAttention",  # NanoLLaVA modeling
+    "SiglipAttention",  # Dragonfly modeling
+    *SiglipSdpaAttention,
+]
+SiglipMLP = [
+    "SigLipMLP",  # NanoLLaVA modeling
+    "SiglipMLP",  # Dragonfly modeling
+]
+
 
 from transformers import PretrainedConfig
 
@@ -472,6 +495,7 @@ class LlmDecoderLayerStruct:
 
 def extract_llm(model: nn.Module) -> LlmModelStruct | None:
     """Extract llm into components."""
+    # region model
     if module_like(model, "LlavaQwen2ForCausalLM"):
         model.model.vision_tower.load_model()
         model.model.vision_tower.to(device=model.model.device)
@@ -479,10 +503,14 @@ def extract_llm(model: nn.Module) -> LlmModelStruct | None:
         backbone_name_vit = "model.vision_tower.vision_tower.vision_model"
         backbone_llm = model.model
         backbone_name_llm = "model"
-    # region model
+    elif module_like(model, "DragonflyForCausalLM"):
+        backbone_vit = model.image_encoder.vision_model
+        backbone_name_vit = "image_encoder.vision_model"
+        backbone_llm = model.language_model.model
+        backbone_name_llm = "model.language_model.model"
     elif module_like(model, (OPTForCausalLM, OPTForSequenceClassification, OPTForQuestionAnswering)):
-        backbone = model.model.decoder
-        backbone_name = "model.decoder"
+        backbone_llm = model.model.decoder
+        backbone_name_llm = "model.decoder"
     elif module_like(
         model,
         (
@@ -496,8 +524,8 @@ def extract_llm(model: nn.Module) -> LlmModelStruct | None:
             Qwen2ForSequenceClassification,
         ),
     ):
-        backbone = model.model
-        backbone_name = "model"
+        backbone_llm = model.model
+        backbone_name_llm = "model"
     else:
         raise ValueError(f"Unsupported model type: {type(model)}")
     # endregion
@@ -531,6 +559,9 @@ def extract_llm(model: nn.Module) -> LlmModelStruct | None:
     ):
         fc = model.score
         fc_name = "score"
+    elif module_like(model, "DragonflyForCausalLM"):
+        fc = model.language_model.lm_head
+        fc_name = "model.language_model.lm_head"
     else:
         raise ValueError(f"Unsupported model type: {type(model)}")
     # endregion
@@ -559,6 +590,7 @@ def extract_llm(model: nn.Module) -> LlmModelStruct | None:
             MixtralConfig,
             Qwen2Config,
             "LlavaQwen2Config",
+            "DragonflyConfig",
         ),
     ):
         hidden_act_key = "hidden_act"
@@ -624,7 +656,7 @@ def extract_llm_backbone(backbone: nn.Module, full_name: str, parent: LlmModelSt
         layers_name = "layers"
         first_ln_name, final_ln_name = "", "norm"
         proj_in_name, proj_out_name = "", ""
-    elif module_like(backbone, "SigLipVisionTransformer"):
+    elif module_like(backbone, *SiglipVisionTransformer):
         embeddings = [backbone.embeddings]
         layers = backbone.encoder.layers
         first_ln, final_ln = None, backbone.post_layernorm
@@ -666,17 +698,17 @@ def extract_llm_layer(layer: nn.Module, layer_idx: int, parent: LlmBackboneStruc
         LlmBlockStruct: Block.
     """
     # region decoder layer
-    if module_like(layer, "SigLipEncoderLayer"):
+    if module_like(layer, *SiglipEncoderLayer):
         attn_ln = layer.layer_norm1
         attn_block = layer.self_attn
         assert module_like(
             attn_block,
-            "SigLipAttention",
+            *SiglipAttention,
         )
         ffn_ln_key = "layer_norm2"
         ffn_ln = getattr(layer, ffn_ln_key)
         ffn_block = layer.mlp
-        assert module_like(ffn_block, "SigLipMLP")
+        assert module_like(ffn_block, *SiglipMLP)
         proj_qkv = [attn_block.q_proj, attn_block.k_proj, attn_block.v_proj]
         proj_out = attn_block.out_proj
         proj_1st = [ffn_block.fc1]

@@ -211,7 +211,9 @@ class LlmCalibrationCache(CalibrationCache):
             split = kompress_data_dict["split"]
             dataset_name_or_path = kompress_data_dict["dataset_name_or_path"]
             text_column = kompress_data_dict["text_column"]
+            image_column = kompress_data_dict.get("image_column", None)
             dataset = load_from_disk(dataset_name_or_path)[split]
+            self.__is_vlm_dataset = kompress_data_dict.get("is_vlm_dataset", False)
         # endregion
         except Exception as e:
 
@@ -234,9 +236,10 @@ class LlmCalibrationCache(CalibrationCache):
         num_tokens = 0
         for _data in dataset:
             line = _data[text_column]
-            img = _data[image_column] if self.__is_vlm_dataset else None
+            imgs = [_data[image_column]] if self.__is_vlm_dataset else None
             line = line.strip()
             line = process_sample(line, self.__is_vlm_dataset)
+
             # line_encoded is a list of token ids
             line_encoded = tokenizer.encode(line)
             seq_length = len(line_encoded)
@@ -256,18 +259,11 @@ class LlmCalibrationCache(CalibrationCache):
                     tok = rng.randint(0, seq_length - self.config.seq_length)
                     sample = sample[:, tok : tok + self.config.seq_length]
 
-            samples.append(CalibSample(sample=sample, images=img))
+            samples.append(CalibSample(text=line, sample=sample, image_srcs=imgs))
             num_tokens += sample.shape[1]
             if len(samples) >= self.config.num_samples and num_tokens >= self.config.num_tokens:
                 break
 
-        samples = [
-            CalibSample(
-                sample=s[:, : self.config.seq_length],
-                images=img,
-            )
-            for s in torch.cat([sample.sample for sample in samples], dim=1).split(self.config.seq_length, dim=1)
-        ]
         if num_tokens > self.config.num_tokens:
             samples = samples[:-1]
         samples = samples[: self.config.num_samples]

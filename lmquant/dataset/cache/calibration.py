@@ -28,16 +28,40 @@ __all__ = ["CalibrationCache"]
 class CalibSample:
     """Calibration sample."""
 
+    text: str
     sample: torch.Tensor
-    images: str | None = None
+    image_srcs: tp.List[str] | None = None
+
+    def images(self, model: torch.nn.Module) -> tp.List[Image.Image]:
+        """Get images."""
+        return [Image.open(img).convert("RGB") for img in self.image_srcs]
 
     def image_tensors(self, model: torch.nn.Module) -> list[torch.Tensor]:
         """Get image tensor."""
         assert hasattr(model, "process_images"), "Expecting a VLM with `process_images` method"
         # TODO: remove prefix
-        prefix = "/home/azureuser/shwu/edge/Amazon-VLM/custom_datasets/pretraining"
-        image = Image.open(os.path.join(prefix, self.images)).convert("RGB")
-        return model.process_images([image], model.config)
+        return model.process_images(self.images(model), model.config)
+
+    def get_model_inputs(self, model: torch.nn.Module) -> dict[str, torch.Tensor]:
+        """Process the calibration sample for the model."""
+        PROCESS_INPUTS_DOC = (
+            f" `model.process_inputs` should expect the following arguments:\n"
+            f" `sample` (torch.Tensor): The input tensor for the model.\n"
+            f" `images` (tp.List[str] | None): The path to the image file(s). Defaults to `None`.\n"
+        )
+
+        assert hasattr(model, "process_inputs"), PROCESS_INPUTS_DOC
+        model_inputs = model.process_inputs(self.text, self.images(model))
+        return {k: self.move_to_device(v, next(model.parameters()).device) for k, v in model_inputs.items()}
+
+    def move_to_device(self, x: tp.Any, device: torch.device) -> None:
+        """Move the sample to a device."""
+        if isinstance(x, torch.Tensor):
+            return x.to(device=device)
+        elif isinstance(x, (list, tuple)) and all(isinstance(i, torch.Tensor) for i in x):
+            return [i.to(device=device) for i in x]
+        else:
+            return x
 
 
 class CalibrationCache(ABC):
@@ -272,11 +296,8 @@ class CalibrationCache(ABC):
                     total=self.num_samples,
                 ):
                     if isinstance(sample, CalibSample):
-                        if sample.images is not None:
-                            model(
-                                input_ids=sample.sample.to(device=device),
-                                images=sample.image_tensors(model).to(dtype=model.dtype).to(device=device),
-                            )
+                        if sample.image_srcs is not None:
+                            model(**sample.get_model_inputs(model))
                         else:
                             model(input_ids=sample.sample.to(device=device))
                     else:

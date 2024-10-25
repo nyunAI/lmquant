@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 import os
 import torch
 from omniconfig import configclass
-from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, AutoProcessorfo
 
 from lmquant.model.config import BaseModelConfig
 
@@ -68,4 +68,10 @@ class LlmModelConfig(BaseModelConfig):
         if self.is_vlm:
             assert hasattr(model, "config"), "The model does not have config."
             setattr(model.config, "is_vlm", True)
+
+            assert hasattr(model, "init_processor"), "The model does not have init_processor."
+            model.init_processor(
+                AutoProcessor.from_pretrained(model.config.image_encoder).image_processor,
+                tokenizer,
+            )
         return model, tokenizer
